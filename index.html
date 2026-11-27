@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Form Checker</title>
+<style>
+  :root { --bg:#0f1412; --card:#1a221f; --text:#eef3f0; --muted:#9bb0a7; --accent:#3ddc97; --warn:#ffb547; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif; }
+  header { padding:12px 16px 4px; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; margin-top:2px; }
+  .ex { display:flex; gap:8px; overflow-x:auto; padding:10px 16px; }
+  .ex button { flex:0 0 auto; background:var(--card); color:var(--text); border:1px solid #2c3833; border-radius:20px; padding:8px 14px; font-size:14px; }
+  .ex button.on { background:var(--accent); color:#06281a; border-color:var(--accent); font-weight:600; }
+  .stage { position:relative; margin:0 12px; border-radius:14px; overflow:hidden; background:#000; aspect-ratio:3/4; max-height:62vh; }
+  @media (orientation:landscape) { .stage { aspect-ratio:16/9; max-height:70vh; } }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .mirror { transform:scaleX(-1); }
+  .hud { position:absolute; left:0; right:0; top:0; display:flex; justify-content:space-between; align-items:flex-start; padding:10px 12px; pointer-events:none; }
+  .count { font-size:64px; font-weight:700; line-height:1; text-shadow:0 2px 8px #000; }
+  .label { font-size:12px; color:#dfe; text-shadow:0 1px 4px #000; }
+  .msg { position:absolute; left:10px; right:10px; bottom:10px; text-align:center; font-size:20px; font-weight:600; padding:10px; border-radius:10px; background:rgba(0,0,0,.55); }
+  .msg.good { color:var(--accent); } .msg.warn { color:var(--warn); } .msg.bad { color:var(--bad); }
+  .placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px; color:var(--muted); font-size:15px; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; padding:12px 16px; }
+  .controls button { flex:1 1 30%; background:var(--card); color:var(--text); border:1px solid #2c3833; border-radius:10px; padding:12px 8px; font-size:15px; }
+  .controls button.primary { background:var(--accent); color:#06281a; border:none; font-weight:700; flex-basis:100%; }
+  .stats { padding:0 16px 8px; color:var(--muted); font-size:13px; }
+  .tips { margin:4px 16px 24px; background:var(--card); border-radius:12px; padding:12px 14px; font-size:13px; color:var(--muted); line-height:1.5; }
+  .tips b { color:var(--text); }
+  .debug { position:absolute; right:10px; top:80px; font:12px/1.4 monospace; background:rgba(0,0,0,.6); padding:6px 8px; border-radius:6px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Form Checker</h1>
+  <div class="sub">Pick an exercise, tap Start, step back until your whole body is in frame.</div>
+</header>
+
+<div class="ex" id="exList"></div>
+
+<div class="stage" id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div class="placeholder" id="placeholder">Camera is off.<br>Tap Start below.</div>
+  <div class="hud">
+    <div><div class="count" id="count">0</div><div class="label" id="countLabel">reps</div></div>
+    <div style="text-align:right"><div class="label" id="partials"></div></div>
+  </div>
+  <div class="debug" id="debug"></div>
+  <div class="msg" id="msg" style="display:none"></div>
+</div>
+
+<div class="controls">
+  <button class="primary" id="startBtn">Start</button>
+  <button id="resetBtn">Reset set</button>
+  <button id="flipBtn">Flip camera</button>
+  <button id="voiceBtn">Voice: on</button>
+  <button id="debugBtn">Show numbers</button>
+</div>
+<div class="stats" id="stats"></div>
+
+<div class="tips" id="tips"></div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const EX = {
+  pushup:  { name:"Push-up",  unit:"reps", tip:"Phone on the floor <b>side-on</b>, about 2 m away, so it sees your whole body from the side." },
+  squat:   { name:"Squat",    unit:"reps", tip:"Phone at hip height, <b>side-on</b>, about 2.5 m away. Head to feet in frame." },
+  lunge:   { name:"Lunge",    unit:"reps", tip:"Phone <b>side-on</b>, about 2.5 m away. Counts every rep, either leg." },
+  plank:   { name:"Plank",    unit:"sec",  tip:"Phone on the floor <b>side-on</b>, about 2 m away. Timer only runs while your body is straight." },
+  pullup:  { name:"Pull-up",  unit:"reps", tip:"Phone <b>facing you</b>, far enough back to see the bar, your hands and your hips. Counts a rep when your chin passes your hands." },
+};
+let current = "pushup";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+let landmarker = null, stream = null, running = false, facing = "user";
+let voiceOn = true, debugOn = false, wakeLock = null;
+
+// ---------- UI ----------
+function buildButtons() {
+  const box = $("exList"); box.innerHTML = "";
+  for (const [key, e] of Object.entries(EX)) {
+    const b = document.createElement("button");
+    b.textContent = e.name; if (key === current) b.className = "on";
+    b.onclick = () => { current = key; buildButtons(); resetSet(); };
+    box.appendChild(b);
+  }
+  $("tips").innerHTML = "<b>Setup:</b> " + EX[current].tip +
+    "<br><b>Light:</b> stand facing a window or light, not with it behind you.<br><b>Wear</b> fitted clothes if you can, it tracks better.";
+  $("countLabel").textContent = EX[current].unit === "sec" ? "seconds" : "reps";
+}
+
+let lastMsg = "", lastMsgAt = 0, lastSpokenMsg = "", lastSpokenAt = 0;
+function show(text, kind = "warn") {
+  const m = $("msg"); m.style.display = "block"; m.textContent = text; m.className = "msg " + kind;
+  lastMsg = text; lastMsgAt = performance.now();
+  const now = performance.now();
+  if (kind !== "good" && (text !== lastSpokenMsg || now - lastSpokenAt > 4000) && now - lastSpokenAt > 2500) {
+    say(text); lastSpokenMsg = text; lastSpokenAt = now;
+  }
+}
+function say(text) {
+  if (!voiceOn || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text); u.rate = 1.1; u.lang = "en-IN";
+  speechSynthesis.speak(u);
+}
+
+// ---------- geometry ----------
+const P = { nose:0, lSh:11, rSh:12, lEl:13, rEl:14, lWr:15, rWr:16, lHip:23, rHip:24, lKn:25, rKn:26, lAn:27, rAn:28 };
+function angle(a, b, c) {
+  const ab = { x:a.x - b.x, y:a.y - b.y }, cb = { x:c.x - b.x, y:c.y - b.y };
+  const dot = ab.x * cb.x + ab.y * cb.y;
+  const m = Math.hypot(ab.x, ab.y) * Math.hypot(cb.x, cb.y);
+  if (!m) return 180;
+  return Math.acos(Math.max(-1, Math.min(1, dot / m))) * 180 / Math.PI;
+}
+const vis = (lm, ...ids) => ids.every(i => (lm[i].visibility ?? 1) > 0.5);
+function side(lm) {
+  const l = lm[P.lSh].visibility + lm[P.lHip].visibility + lm[P.lKn].visibility + lm[P.lEl].visibility;
+  const r = lm[P.rSh].visibility + lm[P.rHip].visibility + lm[P.rKn].visibility + lm[P.rEl].visibility;
+  return l >= r
+    ? { sh:lm[P.lSh], el:lm[P.lEl], wr:lm[P.lWr], hip:lm[P.lHip], kn:lm[P.lKn], an:lm[P.lAn], ids:[P.lSh,P.lEl,P.lWr,P.lHip,P.lKn,P.lAn] }
+    : { sh:lm[P.rSh], el:lm[P.rEl], wr:lm[P.rWr], hip:lm[P.rHip], kn:lm[P.rKn], an:lm[P.rAn], ids:[P.rSh,P.rEl,P.rWr,P.rHip,P.rKn,P.rAn] };
+}
+// > 0 means hip is below the shoulder-ankle line (sagging), < 0 above (piking)
+function hipOffset(s) {
+  const dx = s.an.x - s.sh.x; if (Math.abs(dx) < 1e-3) return 0;
+  const t = (s.hip.x - s.sh.x) / dx;
+  const lineY = s.sh.y + t * (s.an.y - s.sh.y);
+  return s.hip.y - lineY;
+}
+const smooth = {};
+function sm(key, v, a = 0.4) { smooth[key] = smooth[key] == null ? v : smooth[key] + a * (v - smooth[key]); return smooth[key]; }
+
+// ---------- rep state ----------
+let reps = 0, partials = 0, phase = "up", minA = 999, plankSec = 0, lastT = 0, goodStreak = 0;
+function resetSet() {
+  reps = 0; partials = 0; phase = "up"; minA = 999; plankSec = 0; goodStreak = 0;
+  for (const k in smooth) delete smooth[k];
+  $("count").textContent = "0"; $("partials").textContent = ""; $("msg").style.display = "none"; $("stats").textContent = "";
+}
+function countRep() {
+  reps++; $("count").textContent = reps; say(String(reps));
+  show("Good rep", "good");
+}
+function partial(text) {
+  partials++; $("partials").textContent = partials + " half rep" + (partials > 1 ? "s" : "") + " (not counted)";
+  show(text, "warn");
+}
+
+// Generic down/up counter on one angle.
+// downAt: angle that counts as a full-depth rep. upAt: angle for lockout. partialAt: started going down past this but not deep enough.
+function cycle(a, downAt, upAt, partialAt, lowMsg) {
+  if (phase === "up") {
+    if (a < partialAt) { phase = "down"; minA = a; }
+  } else {
+    minA = Math.min(minA, a);
+    if (a > upAt) {
+      if (minA <= downAt) countRep(); else partial(lowMsg);
+      phase = "up"; minA = 999;
+    }
+  }
+}
+
+function analyse(lm, dt) {
+  const s = side(lm);
+  const dbg = [];
+  if (current === "pullup") return pullup(lm, dbg);
+  if (!vis(lm, ...s.ids.slice(0, 1), s.ids[3], s.ids[4])) { show("Move back so your whole body is in view", "bad"); return dbg; }
+
+  if (current === "pushup") {
+    const el = sm("el", angle(s.sh, s.el, s.wr));
+    const body = sm("body", angle(s.sh, s.hip, s.an));
+    const off = hipOffset(s);
+    dbg.push("elbow " + el.toFixed(0), "body " + body.toFixed(0), "hipOff " + off.toFixed(3));
+    if (body < 160) show(off > 0 ? "Hips sagging, squeeze glutes" : "Hips too high, flatten out", "bad");
+    cycle(el, 95, 155, 135, "Go lower, chest to the floor");
+    const elFlare = Math.abs(s.el.x - s.sh.x); dbg.push("elbowFlare " + elFlare.toFixed(3));
+  }
+
+  if (current === "squat") {
+    const kn = sm("kn", angle(s.hip, s.kn, s.an));
+    const torso = sm("torso", Math.abs(Math.atan2(s.sh.x - s.hip.x, s.hip.y - s.sh.y) * 180 / Math.PI));
+    dbg.push("knee " + kn.toFixed(0), "lean " + torso.toFixed(0));
+    if (phase === "down" && torso > 50) show("Chest up", "bad");
+    cycle(kn, 100, 160, 140, "Go lower");
+  }
+
+  if (current === "lunge") {
+    const kL = angle(lm[P.lHip], lm[P.lKn], lm[P.lAn]), kR = angle(lm[P.rHip], lm[P.rKn], lm[P.rAn]);
+    const kn = sm("kn", Math.min(kL, kR));
+    const torso = sm("torso", Math.abs(Math.atan2(s.sh.x - s.hip.x, s.hip.y - s.sh.y) * 180 / Math.PI));
+    dbg.push("front knee " + kn.toFixed(0), "lean " + torso.toFixed(0));
+    if (phase === "down" && torso > 30) show("Stay upright", "bad");
+    cycle(kn, 105, 155, 140, "Drop the back knee lower");
+  }
+
+  if (current === "plank") {
+    const body = sm("body", angle(s.sh, s.hip, s.an));
+    const flat = Math.abs(s.sh.y - s.an.y) < 0.35; // roughly horizontal
+    const off = hipOffset(s);
+    dbg.push("body " + body.toFixed(0), "hipOff " + off.toFixed(3));
+    if (!flat) { show("Get into plank position", "warn"); }
+    else if (body < 165) { show(off > 0 ? "Hips sagging, squeeze glutes" : "Hips too high", "bad"); }
+    else {
+      plankSec += dt;
+      const sec = Math.floor(plankSec);
+      if (sec !== Number($("count").textContent)) {
+        $("count").textContent = sec;
+        if (sec > 0 && sec % 10 === 0) say(sec + " seconds");
+      }
+      if (performance.now() - lastMsgAt > 1500) show("Solid, hold it", "good");
+    }
+  }
+  return dbg;
+}
+
+function pullup(lm, dbg) {
+  if (!vis(lm, P.nose, P.lWr, P.rWr, P.lSh, P.rSh)) { show("Step back so the camera sees your hands and head", "bad"); return dbg; }
+  const wristY = (lm[P.lWr].y + lm[P.rWr].y) / 2;
+  const chinAbove = lm[P.nose].y < wristY + 0.02;
+  const elL = angle(lm[P.lSh], lm[P.lEl], lm[P.lWr]), elR = angle(lm[P.rSh], lm[P.rEl], lm[P.rWr]);
+  const el = sm("el", (elL + elR) / 2);
+  dbg.push("elbow " + el.toFixed(0), "chin " + (chinAbove ? "above" : "below"));
+  if (phase === "up") {            // here "up" means hanging at the bottom, ready
+    if (el < 120) { phase = "down"; minA = el; }
+  } else {
+    minA = Math.min(minA, el);
+    if (chinAbove && phase !== "top") { phase = "top"; countRep(); }
+    if (el > 150) {
+      if (phase === "down") partial("Pull higher, chin over the bar");
+      phase = "up"; minA = 999;
+    }
+  }
+  if (phase === "top" && el > 120 && el < 150 && performance.now() - lastMsgAt > 2000) show("Lower all the way, full hang", "warn");
+  return dbg;
+}
+
+// ---------- camera + loop ----------
+async function initModel() {
+  show("Loading tracker (first time takes a few seconds)…", "warn");
+  const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", delegate },
+    runningMode: "VIDEO", numPoses: 1,
+  });
+  try { landmarker = await PoseLandmarker.createFromOptions(files, opts("GPU")); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(files, opts("CPU")); }
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  video.srcObject = stream; await video.play();
+  video.classList.toggle("mirror", facing === "user"); canvas.classList.toggle("mirror", facing === "user");
+  $("placeholder").style.display = "none";
+}
+
+async function start() {
+  const btn = $("startBtn");
+  if (running) { stop(); return; }
+  btn.textContent = "Starting…";
+  try {
+    if (!landmarker) await initModel();
+    await startCamera();
+    running = true; btn.textContent = "Stop"; $("msg").style.display = "none";
+    say("Ready"); lastT = performance.now();
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+    requestAnimationFrame(loop);
+  } catch (e) {
+    btn.textContent = "Start";
+    show("Couldn't start camera: " + (e.message || e) + ". Allow camera access and try again.", "bad");
+  }
+}
+function stop() {
+  running = false; $("startBtn").textContent = "Start";
+  if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+  $("placeholder").style.display = "flex"; ctx.clearRect(0, 0, canvas.width, canvas.height);
+  try { wakeLock?.release(); } catch {}
+  const unit = EX[current].unit === "sec" ? Math.floor(plankSec) + " sec" : reps + " reps";
+  $("stats").textContent = "Last set: " + EX[current].name + ", " + unit + (partials ? ", " + partials + " half reps" : "");
+}
+
+let drawer = null, lastVideoTime = -1;
+function loop() {
+  if (!running) return;
+  if (video.videoWidth && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; drawer = new DrawingUtils(ctx); }
+    const now = performance.now(); const dt = (now - lastT) / 1000; lastT = now;
+    const res = landmarker.detectForVideo(video, now);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (res.landmarks && res.landmarks.length) {
+      const lm = res.landmarks[0];
+      drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#3ddc97", lineWidth: 4 });
+      drawer.drawLandmarks(lm, { color: "#ffffff", radius: 3 });
+      const dbg = analyse(lm, Math.min(dt, 0.2));
+      $("debug").textContent = dbg.join("\n");
+    } else {
+      show("Can't see you, step into frame", "bad");
+    }
+    if (performance.now() - lastMsgAt > 2500) $("msg").style.display = "none";
+  }
+  requestAnimationFrame(loop);
+}
+
+$("startBtn").onclick = start;
+$("resetBtn").onclick = resetSet;
+$("flipBtn").onclick = async () => { facing = facing === "user" ? "environment" : "user"; if (running) { try { await startCamera(); } catch (e) { show("Couldn't switch camera", "bad"); } } };
+$("voiceBtn").onclick = () => { voiceOn = !voiceOn; $("voiceBtn").textContent = "Voice: " + (voiceOn ? "on" : "off"); };
+$("debugBtn").onclick = () => { debugOn = !debugOn; $("debug").style.display = debugOn ? "block" : "none"; $("debugBtn").textContent = debugOn ? "Hide numbers" : "Show numbers"; };
+document.addEventListener("visibilitychange", async () => { if (running && document.visibilityState === "visible") { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {} } });
+
+buildButtons();
+</script>
+</body>
+</html>
